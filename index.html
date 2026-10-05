@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Bus Tracker</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e5e7eb; --live:#16a34a; --off:#9ca3af; --sel:#eff6ff; --selb:#2563eb; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--fg); background:var(--bg); }
+  #app { display:flex; height:100%; }
+  #side { width:310px; border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  #side h1 { font-size:18px; margin:0; padding:14px 16px; border-bottom:1px solid var(--line); }
+  #side h1 small { display:block; font-size:12px; font-weight:400; color:var(--muted); margin-top:2px; }
+  #side .hint { font-size:12px; color:var(--muted); padding:8px 16px 4px; text-transform:uppercase; letter-spacing:.04em; }
+  #list { overflow:auto; flex:1; }
+  .row { padding:10px 16px; border-bottom:1px solid var(--line); border-left:4px solid transparent; cursor:pointer; display:flex; align-items:center; gap:10px; }
+  .row:hover { background:#f9fafb; }
+  .row.sel { background:var(--sel); border-left-color:var(--selb); }
+  .dot { width:10px; height:10px; border-radius:50%; flex:none; }
+  .row b { display:block; font-size:15px; }
+  .row span { font-size:12px; color:var(--muted); }
+  .row .spd { margin-left:auto; text-align:right; font-variant-numeric:tabular-nums; }
+  .row .spd b { font-size:18px; }
+  #empty { padding:16px; color:var(--muted); font-size:14px; }
+  #map { flex:1; }
+  .bus-icon { background:none; border:none; }
+  .bus-wrap { position:relative; width:56px; height:56px; }
+  .bus-top { position:absolute; left:12px; top:0; width:32px; height:56px; transform-origin:50% 50%; filter:drop-shadow(0 1px 2px rgba(0,0,0,.4)); }
+  .bus-wrap.off .bus-top { filter:grayscale(1) opacity(.65); }
+  .badge { position:absolute; left:50%; bottom:100%; transform:translateX(-50%); white-space:nowrap; background:#111827; color:#fff;
+           font-size:11px; font-weight:600; padding:2px 6px; border-radius:9px; font-variant-numeric:tabular-nums; }
+  .bus-wrap.off .badge { background:var(--off); }
+  .leaflet-popup-content { font-size:13px; line-height:1.5; }
+  @media (max-width:700px) {
+    #app { flex-direction:column-reverse; }
+    #side { width:100%; height:40%; border-right:none; border-top:1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <h1>Live Bus Tracker<small id="clock">Connecting…</small></h1>
+    <div class="hint">Choose whose location to view</div>
+    <div id="list"><div id="empty">No device has shared location yet.</div></div>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script type="module">
+// ============================ CONFIG ============================
+const firebaseConfig = {
+  apiKey: "AIzaSyCzOPbAp8vhCJQo3eZVIij2uPMnD1mrBDY",
+  authDomain: "chitra-tracker.firebaseapp.com",
+  databaseURL: "https://chitra-tracker-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "chitra-tracker",
+  storageBucket: "chitra-tracker.firebasestorage.app",
+  messagingSenderId: "885582708427",
+  appId: "1:885582708427:web:4bf0192dafb3d0804ee54e",
+};
+const DEFAULT_CENTER = [23.8103, 90.4125];   // Dhaka
+const OFFLINE_AFTER_MS = 2 * 60 * 1000;      // grey out if no update for 2 min
+// ================================================================
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js";
+
+const db = getDatabase(initializeApp(firebaseConfig));
+
+const map = L.map("map").setView(DEFAULT_CENTER, 12);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+}).addTo(map);
+
+// Top view of a coaster/minibus, front pointing up (north); rotated by bearing
+const busTop = heading => `
+<svg class="bus-top" viewBox="-4 -12 34 74" style="transform:rotate(${Math.max(heading, 0)}deg)" xmlns="http://www.w3.org/2000/svg">
+  ${heading >= 0 ? '<path d="M13 -11 L19 -4 L13 -6 L7 -4Z" fill="#dc2626"/>' : ""}
+  <rect x="-2.5" y="7" width="3" height="4" rx="1" fill="#1f2937"/><rect x="25.5" y="7" width="3" height="4" rx="1" fill="#1f2937"/>
+  <rect x="1" y="0" width="24" height="60" rx="6" fill="#f59e0b" stroke="#92400e" stroke-width="1.5"/>
+  <path d="M4 5 Q13 1 22 5 L21 12 Q13 10 5 12Z" fill="#bfdbfe" stroke="#1e3a8a" stroke-width=".8"/>
+  <rect x="3" y="1.5" width="3" height="2" rx=".8" fill="#fef9c3"/><rect x="20" y="1.5" width="3" height="2" rx=".8" fill="#fef9c3"/>
+  <rect x="5" y="15" width="16" height="38" rx="2.5" fill="#fbbf24" stroke="#b45309" stroke-width=".6"/>
+  <rect x="9" y="21" width="8" height="6" rx="1" fill="#e5e7eb" stroke="#9ca3af" stroke-width=".5"/>
+  <rect x="9" y="38" width="8" height="6" rx="1" fill="#e5e7eb" stroke="#9ca3af" stroke-width=".5"/>
+  <rect x="6" y="55" width="14" height="3" rx="1" fill="#bfdbfe" stroke="#1e3a8a" stroke-width=".6"/>
+  <rect x="2.5" y="57" width="3" height="1.8" rx=".6" fill="#dc2626"/><rect x="20.5" y="57" width="3" height="1.8" rx=".6" fill="#dc2626"/>
+</svg>`;
+const DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+const hasDir = d => typeof d.bearing === "number" && d.bearing >= 0;
+const dirText = d => hasDir(d) ? `${DIRS[Math.round(d.bearing / 45) % 8]} ${d.bearing}°` : "–";
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const ago = ms => ms < 60e3 ? `${Math.max(0, Math.round(ms / 1e3))} s ago` : ms < 3600e3 ? `${Math.round(ms / 60e3)} min ago`
+                : ms < 86400e3 ? `${Math.round(ms / 3600e3)} h ago` : `${Math.round(ms / 86400e3)} d ago`;
+const timeStr = ts => new Date(ts).toLocaleString("en-GB", { timeZone: "Asia/Dhaka", hour12: false });
+const label = (id, d) => `${d.name || "Device"} · ${id.slice(-4).toUpperCase()}`;
+
+let serverOffset = 0;
+onValue(ref(db, ".info/serverTimeOffset"), s => serverOffset = s.val() || 0);
+const now = () => Date.now() + serverOffset;
+const isLive = d => d && d.active !== false && d.ts && now() - d.ts < OFFLINE_AFTER_MS;
+const valid = d => typeof d?.lat === "number" && typeof d?.lng === "number";
+
+function busIcon(id, d, live) {
+  const dir = hasDir(d) ? " · " + DIRS[Math.round(d.bearing / 45) % 8] : "";
+  const text = live ? `${label(id, d)} · ${d.speed ?? 0} km/h${dir}` : `${label(id, d)} · offline`;
+  return L.divIcon({
+    className: "bus-icon",
+    html: `<div class="bus-wrap ${live ? "" : "off"}"><div class="badge">${esc(text)}</div>${busTop(hasDir(d) ? d.bearing : -1)}</div>`,
+    iconSize: [56, 56], iconAnchor: [28, 28], popupAnchor: [0, -44],
+  });
+}
+
+const markers = {};                                          // id → Leaflet marker
+let devices = {};                                            // id → data
+let selected = decodeURIComponent(location.hash.slice(1));   // "" = all devices
+let needFit = true;
+let loaded = false;
+
+function select(id) {
+  selected = id;
+  history.replaceState(null, "", id ? "#" + encodeURIComponent(id) : location.pathname + location.search);
+  needFit = true;
+  update();
+}
+
+onValue(ref(db, "live"), snap => {
+  devices = snap.val() || {};
+  loaded = true;
+  update();
+}, err => {
+  document.getElementById("clock").textContent = "Database error: " + err.message;
+});
+
+function update() {
+  if (!loaded) return;
+  const ids = Object.keys(devices).filter(id => valid(devices[id]))
+    .sort((a, b) => (isLive(devices[b]) - isLive(devices[a])) || label(a, devices[a]).localeCompare(label(b, devices[b])));
+
+  // Auto-select when only one device exists; drop a selection that no longer exists
+  if (selected && !devices[selected]) selected = "";
+  if (!selected && ids.length === 1) selected = ids[0];
+  const shown = selected ? [selected] : ids;
+
+  // Markers
+  for (const id of Object.keys(markers)) if (!shown.includes(id)) { map.removeLayer(markers[id]); delete markers[id]; }
+  for (const id of shown) {
+    const d = devices[id], live = isLive(d), ll = [d.lat, d.lng];
+    const popup = `<b>${esc(label(id, d))}</b><br>Speed: ${live ? d.speed ?? 0 : 0} km/h<br>Direction: ${dirText(d)}<br>Accuracy: ±${d.acc ?? "?"} m<br>Updated: ${timeStr(d.ts)} (${ago(now() - d.ts)})`;
+    if (!markers[id]) markers[id] = L.marker(ll).addTo(map).bindPopup(popup);
+    markers[id].setLatLng(ll).setIcon(busIcon(id, d, live)).setPopupContent(popup).setZIndexOffset(live ? 1000 : 0);
+  }
+
+  // Camera: fit on selection change; follow the selected device if it leaves the view
+  if (needFit && shown.length) {
+    needFit = false;
+    if (shown.length === 1) map.setView([devices[shown[0]].lat, devices[shown[0]].lng], Math.max(map.getZoom(), 16));
+    else map.fitBounds(shown.map(id => [devices[id].lat, devices[id].lng]), { padding: [60, 60], maxZoom: 15 });
+  } else if (selected && devices[selected] && !map.getBounds().pad(-0.15).contains([devices[selected].lat, devices[selected].lng])) {
+    map.panTo([devices[selected].lat, devices[selected].lng]);
+  }
+
+  // Device chooser list
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  if (!ids.length) { list.innerHTML = '<div id="empty">No device has shared location yet.</div>'; return; }
+  if (ids.length > 1) {
+    const all = document.createElement("div");
+    all.className = "row" + (selected ? "" : " sel");
+    all.innerHTML = `<div class="dot" style="background:#2563eb"></div><div><b>All devices</b><span>${ids.filter(i => isLive(devices[i])).length} live of ${ids.length}</span></div>`;
+    all.onclick = () => select("");
+    list.appendChild(all);
+  }
+  for (const id of ids) {
+    const d = devices[id], live = isLive(d);
+    const row = document.createElement("div");
+    row.className = "row" + (id === selected ? " sel" : "");
+    row.innerHTML = `<div class="dot" style="background:var(${live ? "--live" : "--off"})"></div>
+      <div><b>${esc(label(id, d))}</b><span>${live ? "Live" : "Offline"} · ${ago(now() - d.ts)}${live && hasDir(d) ? " · " + DIRS[Math.round(d.bearing / 45) % 8] : ""}</span></div>
+      <div class="spd"><b>${live ? d.speed ?? 0 : "–"}</b><br><span>km/h</span></div>`;
+    row.onclick = () => { select(id); markers[id]?.openPopup(); };
+    list.appendChild(row);
+  }
+}
+
+// Refresh "x s ago" and live/offline state every 5 s even without new data
+function tick() {
+  update();
+  document.getElementById("clock").textContent =
+    "Dhaka time " + new Date(now()).toLocaleTimeString("en-GB", { timeZone: "Asia/Dhaka" }) +
+    " · " + Object.values(devices).filter(isLive).length + " live";
+}
+setInterval(tick, 5000);
+setTimeout(tick, 800);
+</script>
+</body>
+</html>
