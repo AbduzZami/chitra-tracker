@@ -23,6 +23,8 @@
   .row span { font-size:12px; color:var(--muted); }
   .row .spd { margin-left:auto; text-align:right; font-variant-numeric:tabular-nums; }
   .row .spd b { font-size:18px; }
+  #list .hint { padding:12px 16px 4px; }
+  #note { display:none; background:#111827; color:#fff; font-size:13px; padding:6px 10px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.3); }
   #empty { padding:16px; color:var(--muted); font-size:14px; }
   #map { flex:1; }
   .bus-icon { background:none; border:none; }
@@ -117,13 +119,20 @@ function busIcon(id, d, live) {
 
 const markers = {};                                          // id → Leaflet marker
 let devices = {};                                            // id → data
-let selected = decodeURIComponent(location.hash.slice(1));   // "" = all devices
+// Selection: "active" (default) = all live devices, "all" = every device, otherwise a device ID
+let selected = decodeURIComponent(location.hash.slice(1)) || "active";
 let needFit = true;
 let loaded = false;
+let lastShownKey = "";
+
+// Message shown on the map when the current view has nothing to show
+const note = L.control({ position: "topright" });
+note.onAdd = () => { const d = L.DomUtil.create("div"); d.id = "note"; return d; };
+note.addTo(map);
 
 function select(id) {
   selected = id;
-  history.replaceState(null, "", id ? "#" + encodeURIComponent(id) : location.pathname + location.search);
+  history.replaceState(null, "", id === "active" ? location.pathname + location.search : "#" + encodeURIComponent(id));
   needFit = true;
   update();
 }
@@ -136,15 +145,27 @@ onValue(ref(db, "live"), snap => {
   document.getElementById("clock").textContent = "Database error: " + err.message;
 });
 
+function groupRow(key, title, sub, color) {
+  const r = document.createElement("div");
+  r.className = "row" + (selected === key ? " sel" : "");
+  r.innerHTML = `<div class="dot" style="background:${color}"></div><div><b>${title}</b><span>${sub}</span></div>`;
+  r.onclick = () => select(key);
+  return r;
+}
+
 function update() {
   if (!loaded) return;
   const ids = Object.keys(devices).filter(id => valid(devices[id]))
     .sort((a, b) => (isLive(devices[b]) - isLive(devices[a])) || label(a, devices[a]).localeCompare(label(b, devices[b])));
+  const liveIds = ids.filter(id => isLive(devices[id]));
 
-  // Auto-select when only one device exists; drop a selection that no longer exists
-  if (selected && !devices[selected]) selected = "";
-  if (!selected && ids.length === 1) selected = ids[0];
-  const shown = selected ? [selected] : ids;
+  // A selected device that no longer exists → back to "All active devices"
+  if (selected !== "active" && selected !== "all" && !devices[selected]) selected = "active";
+  const shown = selected === "active" ? liveIds : selected === "all" ? ids : [selected];
+
+  // Refit the map when the selection or the set of shown devices changes (e.g. a bus becomes active)
+  const key = selected + "|" + shown.join(",");
+  if (key !== lastShownKey) { lastShownKey = key; needFit = true; }
 
   // Markers
   for (const id of Object.keys(markers)) if (!shown.includes(id)) { map.removeLayer(markers[id]); delete markers[id]; }
@@ -155,25 +176,29 @@ function update() {
     markers[id].setLatLng(ll).setIcon(busIcon(id, d, live)).setPopupContent(popup).setZIndexOffset(live ? 1000 : 0);
   }
 
-  // Camera: fit on selection change; follow the selected device if it leaves the view
+  // Camera: fit when the view changes; follow a single selected device if it leaves the view
   if (needFit && shown.length) {
     needFit = false;
     if (shown.length === 1) map.setView([devices[shown[0]].lat, devices[shown[0]].lng], Math.max(map.getZoom(), 16));
     else map.fitBounds(shown.map(id => [devices[id].lat, devices[id].lng]), { padding: [60, 60], maxZoom: 15 });
-  } else if (selected && devices[selected] && !map.getBounds().pad(-0.15).contains([devices[selected].lat, devices[selected].lng])) {
-    map.panTo([devices[selected].lat, devices[selected].lng]);
+  } else if (shown.length === 1 && !map.getBounds().pad(-0.15).contains([devices[shown[0]].lat, devices[shown[0]].lng])) {
+    map.panTo([devices[shown[0]].lat, devices[shown[0]].lng]);
   }
 
-  // Device chooser list
+  const noteEl = document.getElementById("note");
+  noteEl.textContent = !ids.length ? "No device has shared location yet"
+    : selected === "active" && !liveIds.length ? "No device is sharing location right now" : "";
+  noteEl.style.display = noteEl.textContent ? "block" : "none";
+
+  // Chooser list: All active devices, All devices, then each device
   const list = document.getElementById("list");
   list.innerHTML = "";
-  if (!ids.length) { list.innerHTML = '<div id="empty">No device has shared location yet.</div>'; return; }
-  if (ids.length > 1) {
-    const all = document.createElement("div");
-    all.className = "row" + (selected ? "" : " sel");
-    all.innerHTML = `<div class="dot" style="background:#2563eb"></div><div><b>All devices</b><span>${ids.filter(i => isLive(devices[i])).length} live of ${ids.length}</span></div>`;
-    all.onclick = () => select("");
-    list.appendChild(all);
+  list.appendChild(groupRow("active", "All active devices", `${liveIds.length} sharing now`, "var(--live)"));
+  list.appendChild(groupRow("all", "All devices", `${ids.length} device${ids.length === 1 ? "" : "s"} · ${liveIds.length} live`, "#2563eb"));
+  if (ids.length) {
+    const h = document.createElement("div");
+    h.className = "hint"; h.textContent = "Devices";
+    list.appendChild(h);
   }
   for (const id of ids) {
     const d = devices[id], live = isLive(d);
