@@ -2,9 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Live Bus Tracker</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
 <style>
   :root { --bg:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e5e7eb; --live:#16a34a; --off:#9ca3af; --sel:#eff6ff; --selb:#2563eb; }
   * { box-sizing:border-box; }
@@ -24,6 +26,11 @@
   .row .spd { margin-left:auto; text-align:right; font-variant-numeric:tabular-nums; }
   .row .spd b { font-size:18px; }
   #list .hint { padding:12px 16px 4px; }
+  .me-dot { width:16px; height:16px; margin:3px; border-radius:50%; background:#2563eb; border:3px solid #fff;
+            box-shadow:0 0 0 2px rgba(37,99,235,.35), 0 1px 4px rgba(0,0,0,.4); animation:pulse 2s infinite; }
+  @keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(37,99,235,.5), 0 1px 4px rgba(0,0,0,.4); } 70% { box-shadow:0 0 0 12px rgba(37,99,235,0), 0 1px 4px rgba(0,0,0,.4); } 100% { box-shadow:0 0 0 0 rgba(37,99,235,0), 0 1px 4px rgba(0,0,0,.4); } }
+  .locate-btn a { display:flex !important; align-items:center; justify-content:center; color:#374151; }
+  .locate-btn a.on { color:#2563eb; }
   #note { display:none; background:#111827; color:#fff; font-size:13px; padding:6px 10px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.3); }
   #empty { padding:16px; color:var(--muted); font-size:14px; }
   #map { flex:1; }
@@ -36,6 +43,8 @@
   .bus-wrap.off .badge { background:var(--off); }
   .leaflet-popup-content { font-size:13px; line-height:1.5; }
   @media (max-width:700px) {
+    .leaflet-bottom.leaflet-left { bottom:44px; }               /* keep layer button above the wrapped copyright text */
+    .leaflet-control-attribution { font-size:10px; line-height:1.3; }
     #app { flex-direction:column-reverse; }
     #side { width:100%; height:40%; border-right:none; border-top:1px solid var(--line); }
   }
@@ -52,6 +61,8 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.4/leaflet-maplibre-gl.js"></script>
 <script type="module">
 // ============================ CONFIG ============================
 const firebaseConfig = {
@@ -73,9 +84,14 @@ import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/12
 const db = getDatabase(initializeApp(firebaseConfig));
 
 const map = L.map("map").setView(DEFAULT_CENTER, 12);
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-}).addTo(map);
+// Map: OpenFreeMap vector tiles (free, no API key, no registration, no usage limits) drawn with MapLibre
+// inside Leaflet. Switcher offers a light style and OpenStreetMap raster as a fallback.
+const OSM_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const OFM_ATTR = '<a href="https://openfreemap.org" target="_blank">OpenFreeMap</a> ' + OSM_ATTR;
+const streets = L.maplibreGL({ style: "https://tiles.openfreemap.org/styles/liberty", attribution: OFM_ATTR }).addTo(map);
+const light   = L.maplibreGL({ style: "https://tiles.openfreemap.org/styles/positron", attribution: OFM_ATTR });
+const osm     = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: OSM_ATTR });
+L.control.layers({ "Streets": streets, "Light": light, "OpenStreetMap": osm }, null, { position: "bottomleft" }).addTo(map);
 
 // Top view of a coaster/minibus, front pointing up (north); rotated by bearing
 const busTop = heading => `
@@ -145,6 +161,65 @@ onValue(ref(db, "live"), snap => {
   document.getElementById("clock").textContent = "Database error: " + err.message;
 });
 
+// ---------------- Viewer's own location (stays in this browser, never uploaded) ----------------
+let me = null, meMarker = null, meCircle = null, watchId = null, centerOnFix = false;
+let flash = { text: "", until: 0 };
+const meIcon = L.divIcon({ className: "", html: '<div class="me-dot"></div>', iconSize: [22, 22], iconAnchor: [11, 11] });
+
+function showFlash(text) { flash = { text, until: Date.now() + 6000 }; update(); }
+
+function startLocate(center) {
+  if (!navigator.geolocation) { showFlash("Your browser cannot share location"); return; }
+  if (watchId !== null) {                       // already tracking → just re-center
+    if (center && me) map.setView([me.lat, me.lng], Math.max(map.getZoom(), 16));
+    return;
+  }
+  centerOnFix = center;
+  watchId = navigator.geolocation.watchPosition(pos => {
+    me = { lat: pos.coords.latitude, lng: pos.coords.longitude, acc: Math.round(pos.coords.accuracy) };
+    const ll = [me.lat, me.lng];
+    if (!meMarker) {
+      meCircle = L.circle(ll, { radius: me.acc, color: "#2563eb", weight: 1, fillOpacity: 0.08, interactive: false }).addTo(map);
+      meMarker = L.marker(ll, { icon: meIcon, zIndexOffset: 2000 }).addTo(map);
+    }
+    meMarker.setLatLng(ll).bindPopup(`<b>You are here</b><br>Accuracy: ±${me.acc} m`);
+    meCircle.setLatLng(ll).setRadius(me.acc);
+    if (centerOnFix) { centerOnFix = false; map.setView(ll, Math.max(map.getZoom(), 16)); }
+    document.querySelector(".locate-btn a").classList.add("on");
+    update();
+  }, err => {
+    navigator.geolocation.clearWatch(watchId); watchId = null;
+    showFlash(err.code === 1 ? "Location permission denied — allow it in browser settings" : "Could not get your location");
+  }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 });
+}
+
+// 📍 button under the zoom buttons
+const LocateCtl = L.Control.extend({
+  options: { position: "topleft" },
+  onAdd() {
+    const box = L.DomUtil.create("div", "leaflet-bar locate-btn");
+    const a = L.DomUtil.create("a", "", box);
+    a.href = "#"; a.title = "Show my location"; a.setAttribute("role", "button");
+    a.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="8"/></svg>';
+    L.DomEvent.on(a, "click", e => { L.DomEvent.stop(e); startLocate(true); });
+    L.DomEvent.disableClickPropagation(box);
+    return box;
+  }
+});
+new LocateCtl().addTo(map);
+
+// If the viewer already allowed location before, show it automatically (no prompt)
+navigator.permissions?.query({ name: "geolocation" }).then(r => { if (r.state === "granted") startLocate(false); }).catch(() => {});
+
+// Distance from viewer to a device
+function distText(d) {
+  if (!me) return "";
+  const R = 6371000, toR = x => x * Math.PI / 180;
+  const a = Math.sin(toR(d.lat - me.lat) / 2) ** 2 + Math.cos(toR(me.lat)) * Math.cos(toR(d.lat)) * Math.sin(toR(d.lng - me.lng) / 2) ** 2;
+  const m = 2 * R * Math.asin(Math.sqrt(a));
+  return m < 1000 ? `${Math.round(m / 10) * 10} m` : `${(m / 1000).toFixed(m < 10000 ? 1 : 0)} km`;
+}
+
 function groupRow(key, title, sub, color) {
   const r = document.createElement("div");
   r.className = "row" + (selected === key ? " sel" : "");
@@ -171,7 +246,7 @@ function update() {
   for (const id of Object.keys(markers)) if (!shown.includes(id)) { map.removeLayer(markers[id]); delete markers[id]; }
   for (const id of shown) {
     const d = devices[id], live = isLive(d), ll = [d.lat, d.lng];
-    const popup = `<b>${esc(label(id, d))}</b><br>Speed: ${live ? d.speed ?? 0 : 0} km/h<br>Direction: ${dirText(d)}<br>Accuracy: ±${d.acc ?? "?"} m<br>Updated: ${timeStr(d.ts)} (${ago(now() - d.ts)})`;
+    const popup = `<b>${esc(label(id, d))}</b><br>Speed: ${live ? d.speed ?? 0 : 0} km/h<br>Direction: ${dirText(d)}${me ? "<br>Distance from you: " + distText(d) : ""}<br>Accuracy: ±${d.acc ?? "?"} m<br>Updated: ${timeStr(d.ts)} (${ago(now() - d.ts)})`;
     if (!markers[id]) markers[id] = L.marker(ll).addTo(map).bindPopup(popup);
     markers[id].setLatLng(ll).setIcon(busIcon(id, d, live)).setPopupContent(popup).setZIndexOffset(live ? 1000 : 0);
   }
@@ -186,7 +261,7 @@ function update() {
   }
 
   const noteEl = document.getElementById("note");
-  noteEl.textContent = !ids.length ? "No device has shared location yet"
+  noteEl.textContent = Date.now() < flash.until ? flash.text : !ids.length ? "No device has shared location yet"
     : selected === "active" && !liveIds.length ? "No device is sharing location right now" : "";
   noteEl.style.display = noteEl.textContent ? "block" : "none";
 
@@ -205,7 +280,7 @@ function update() {
     const row = document.createElement("div");
     row.className = "row" + (id === selected ? " sel" : "");
     row.innerHTML = `<div class="dot" style="background:var(${live ? "--live" : "--off"})"></div>
-      <div><b>${esc(label(id, d))}</b><span>${live ? "Live" : "Offline"} · ${ago(now() - d.ts)}${live && hasDir(d) ? " · " + DIRS[Math.round(d.bearing / 45) % 8] : ""}</span></div>
+      <div><b>${esc(label(id, d))}</b><span>${live ? "Live" : "Offline"} · ${ago(now() - d.ts)}${live && hasDir(d) ? " · " + DIRS[Math.round(d.bearing / 45) % 8] : ""}${me ? " · " + distText(d) + " away" : ""}</span></div>
       <div class="spd"><b>${live ? d.speed ?? 0 : "–"}</b><br><span>km/h</span></div>`;
     row.onclick = () => { select(id); markers[id]?.openPopup(); };
     list.appendChild(row);
